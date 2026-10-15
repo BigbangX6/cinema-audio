@@ -1,0 +1,135 @@
+package fr.cinema.retourson
+
+import android.app.Activity
+import android.app.AlertDialog
+import android.content.Intent
+import android.graphics.Color
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import android.view.View
+import android.widget.Button
+import android.widget.TextView
+import android.widget.Toast
+
+class RecorderActivity : Activity() {
+    private val handler = Handler(Looper.getMainLooper())
+    private lateinit var meter: LevelMeterView
+    private lateinit var txtInput: TextView
+    private lateinit var txtFormat: TextView
+    private lateinit var txtClip: TextView
+    private lateinit var btnRec: Button
+    private lateinit var txtFile: TextView
+    private lateinit var txtNet: TextView
+    private lateinit var txtError: TextView
+
+    private val tick = object : Runnable {
+        override fun run() {
+            refresh()
+            handler.postDelayed(this, 50)
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_recorder)
+        meter = findViewById(R.id.meter)
+        txtInput = findViewById(R.id.txtInput)
+        txtFormat = findViewById(R.id.txtFormat)
+        txtClip = findViewById(R.id.txtClip)
+        btnRec = findViewById(R.id.btnRec)
+        txtFile = findViewById(R.id.txtFile)
+        txtNet = findViewById(R.id.txtNet)
+        txtError = findViewById(R.id.txtError)
+
+        if (!CaptureService.running) CaptureService.start(this)
+
+        // Démarrer = immédiat. Arrêter = confirmation, pour éviter de couper une prise par erreur.
+        btnRec.setOnClickListener {
+            if (CaptureService.recording) confirmStop() else CaptureService.command(this, CaptureService.ACTION_REC)
+        }
+        findViewById<Button>(R.id.btnTakes).setOnClickListener {
+            startActivity(Intent(this, TakesActivity::class.java))
+        }
+        findViewById<Button>(R.id.btnQuit).setOnClickListener {
+            if (CaptureService.recording) {
+                Toast.makeText(this, "Arrête d'abord l'enregistrement", Toast.LENGTH_SHORT).show()
+            } else {
+                CaptureService.stop(this)
+                finish()
+            }
+        }
+    }
+
+    private fun confirmStop() {
+        AlertDialog.Builder(this)
+            .setTitle("Arrêter l'enregistrement ?")
+            .setMessage(CaptureService.fileName)
+            .setPositiveButton("Arrêter") { _, _ ->
+                CaptureService.command(this, CaptureService.ACTION_STOP_REC)
+            }
+            .setNegativeButton("Continuer", null)
+            .show()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        handler.post(tick)
+    }
+
+    override fun onPause() {
+        handler.removeCallbacks(tick)
+        super.onPause()
+    }
+
+    private fun refresh() {
+        meter.setPeak(CaptureService.meterPeak)
+        CaptureService.meterPeak = 0f
+        val now = SystemClock.elapsedRealtime()
+
+        if (CaptureService.running) {
+            txtInput.text = "Entrée : ${CaptureService.inputName}"
+            txtInput.setTextColor(if (CaptureService.inputIsUsb) Color.LTGRAY else Color.rgb(255, 170, 0))
+            if (!CaptureService.inputIsUsb && CaptureService.inputName.isNotEmpty()) {
+                txtInput.text = "⚠ Micro USB non détecté — entrée : ${CaptureService.inputName}"
+            }
+        } else {
+            txtInput.text = "Micro arrêté"
+        }
+        txtFormat.text = CaptureService.formatName
+        when {
+            CaptureService.running && CaptureService.micBlocked -> {
+                txtClip.text = "⚠ MICRO COUPÉ — ferme Rode Central ou l'autre appli qui utilise le micro"
+                txtClip.setBackgroundColor(Color.rgb(198, 40, 40))
+                txtClip.visibility = View.VISIBLE
+            }
+            CaptureService.running && !CaptureService.inputIsUsb && CaptureService.inputName.isNotEmpty() -> {
+                txtClip.text = "⚠ MICRO USB NON BRANCHÉ"
+                txtClip.setBackgroundColor(Color.rgb(230, 120, 0))
+                txtClip.visibility = View.VISIBLE
+            }
+            now < CaptureService.clipUntil -> {
+                txtClip.text = "SATURATION"
+                txtClip.setBackgroundColor(Color.rgb(198, 40, 40))
+                txtClip.visibility = View.VISIBLE
+            }
+            else -> txtClip.visibility = View.INVISIBLE
+        }
+
+        if (CaptureService.recording) {
+            btnRec.text = "● REC  " + formatDuration(now - CaptureService.recStartMs)
+            btnRec.setBackgroundColor(Color.rgb(200, 30, 30))
+            txtFile.text = CaptureService.fileName ?: ""
+        } else {
+            btnRec.text = "ENREGISTRER"
+            btnRec.setBackgroundColor(Color.rgb(70, 70, 70))
+            txtFile.text = CaptureService.fileName?.let { "Dernier fichier : Music/RetourSon/$it" } ?: ""
+        }
+
+        val n = CaptureService.listenerCount
+        txtNet.text = (if (n == 0) "Aucun retour connecté" else "$n retour(s) connecté(s)") +
+            "\nIP : " + Net.localIpv4().joinToString(", ").ifEmpty { "aucune" }
+        txtError.text = CaptureService.error ?: ""
+    }
+}
