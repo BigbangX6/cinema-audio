@@ -24,6 +24,20 @@ class RecorderActivity : Activity() {
     private lateinit var txtNet: TextView
     private lateinit var txtError: TextView
 
+    private var frame = 0
+    private var ipText = ""
+    private var nextIpCheck = 0L
+
+    /** L'IP ne change presque jamais : on ne relit les interfaces réseau que toutes les 2 s. */
+    private fun localIp(): String {
+        val now = SystemClock.elapsedRealtime()
+        if (now >= nextIpCheck) {
+            ipText = Net.localIpv4().joinToString(", ").ifEmpty { "aucune" }
+            nextIpCheck = now + 2000
+        }
+        return ipText
+    }
+
     private val tick = object : Runnable {
         override fun run() {
             refresh()
@@ -47,7 +61,16 @@ class RecorderActivity : Activity() {
 
         // Démarrer = immédiat. Arrêter = confirmation, pour éviter de couper une prise par erreur.
         btnRec.setOnClickListener {
-            if (CaptureService.recording) confirmStop() else CaptureService.command(this, CaptureService.ACTION_REC)
+            when {
+                CaptureService.recording -> confirmStop()
+                // Comme l'enregistreur du téléphone : on refuse plutôt que d'enregistrer une prise muette.
+                CaptureService.micBlocked -> AlertDialog.Builder(this)
+                    .setTitle("Enregistrement impossible")
+                    .setMessage("Une autre application utilise le micro (Rode Central ?). Ferme-la : le micro revient tout seul.")
+                    .setPositiveButton("OK", null)
+                    .show()
+                else -> CaptureService.command(this, CaptureService.ACTION_REC)
+            }
         }
         findViewById<Button>(R.id.btnTakes).setOnClickListener {
             startActivity(Intent(this, TakesActivity::class.java))
@@ -86,50 +109,52 @@ class RecorderActivity : Activity() {
     private fun refresh() {
         meter.setPeak(CaptureService.meterPeak)
         CaptureService.meterPeak = 0f
+        if (frame++ % 4 != 0) return
         val now = SystemClock.elapsedRealtime()
 
         if (CaptureService.running) {
-            txtInput.text = "Entrée : ${CaptureService.inputName}"
+            txtInput.setTextIfChanged("Entrée : ${CaptureService.inputName}")
             txtInput.setTextColor(if (CaptureService.inputIsUsb) Color.LTGRAY else Color.rgb(255, 170, 0))
             if (!CaptureService.inputIsUsb && CaptureService.inputName.isNotEmpty()) {
-                txtInput.text = "⚠ Micro USB non détecté — entrée : ${CaptureService.inputName}"
+                txtInput.setTextIfChanged("⚠ Micro USB non détecté — entrée : ${CaptureService.inputName}")
             }
         } else {
-            txtInput.text = "Micro arrêté"
+            txtInput.setTextIfChanged("Micro arrêté")
         }
-        txtFormat.text = CaptureService.formatName
+        txtFormat.setTextIfChanged(CaptureService.formatName)
         when {
             CaptureService.running && CaptureService.micBlocked -> {
-                txtClip.text = "⚠ MICRO COUPÉ — ferme Rode Central ou l'autre appli qui utilise le micro"
-                txtClip.setBackgroundColor(Color.rgb(198, 40, 40))
+                txtClip.setTextIfChanged("⚠ MICRO COUPÉ — ferme Rode Central ou l'autre appli qui utilise le micro")
+                txtClip.setBgIfChanged(Color.rgb(198, 40, 40))
                 txtClip.visibility = View.VISIBLE
             }
             CaptureService.running && !CaptureService.inputIsUsb && CaptureService.inputName.isNotEmpty() -> {
-                txtClip.text = "⚠ MICRO USB NON BRANCHÉ"
-                txtClip.setBackgroundColor(Color.rgb(230, 120, 0))
+                txtClip.setTextIfChanged("⚠ MICRO USB NON BRANCHÉ")
+                txtClip.setBgIfChanged(Color.rgb(230, 120, 0))
                 txtClip.visibility = View.VISIBLE
             }
             now < CaptureService.clipUntil -> {
-                txtClip.text = "SATURATION"
-                txtClip.setBackgroundColor(Color.rgb(198, 40, 40))
+                txtClip.setTextIfChanged("SATURATION")
+                txtClip.setBgIfChanged(Color.rgb(198, 40, 40))
                 txtClip.visibility = View.VISIBLE
             }
             else -> txtClip.visibility = View.INVISIBLE
         }
 
         if (CaptureService.recording) {
-            btnRec.text = "● REC  " + formatDuration(now - CaptureService.recStartMs)
-            btnRec.setBackgroundColor(Color.rgb(200, 30, 30))
-            txtFile.text = CaptureService.fileName ?: ""
+            btnRec.setTextIfChanged("● REC  " + formatDuration(now - CaptureService.recStartMs))
+            btnRec.setBgIfChanged(Color.rgb(200, 30, 30))
+            txtFile.setTextIfChanged(CaptureService.fileName ?: "")
         } else {
-            btnRec.text = "ENREGISTRER"
-            btnRec.setBackgroundColor(Color.rgb(70, 70, 70))
-            txtFile.text = CaptureService.fileName?.let { "Dernier fichier : Music/RetourSon/$it" } ?: ""
+            btnRec.setTextIfChanged("ENREGISTRER")
+            btnRec.setBgIfChanged(Color.rgb(70, 70, 70))
+            txtFile.setTextIfChanged(CaptureService.fileName?.let { "Dernier fichier : Music/RetourSon/$it" } ?: "")
         }
 
         val n = CaptureService.listenerCount
-        txtNet.text = (if (n == 0) "Aucun retour connecté" else "$n retour(s) connecté(s)") +
-            "\nIP : " + Net.localIpv4().joinToString(", ").ifEmpty { "aucune" }
-        txtError.text = CaptureService.error ?: ""
+        txtNet.setTextIfChanged((if (n == 0) "Aucun retour connecté" else "$n retour(s) connecté(s)") +
+            "\nIP : " + localIp() +
+            (CaptureService.remoteInfo?.let { "\n$it" } ?: ""))
+        txtError.setTextIfChanged(CaptureService.error ?: "")
     }
 }

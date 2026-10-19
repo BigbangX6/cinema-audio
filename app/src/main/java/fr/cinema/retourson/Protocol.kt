@@ -7,6 +7,9 @@ package fr.cinema.retourson
  *   magic BEACON | flags u8 | len u8 | nom UTF-8
  * Hello (retour -> enregistreur:AUDIO_PORT, 2/s) : magic HELLO
  *   L'enregistreur n'envoie l'audio qu'aux retours vus depuis moins de 3 s.
+ * Commande (retour -> enregistreur:AUDIO_PORT) : magic COMMAND | id i32 | rec u8 (1 = démarrer, 0 = arrêter) | len u8 | nom UTF-8
+ *   Répétée jusqu'à ce que l'état REC des paquets audio change ; l'enregistreur n'applique
+ *   chaque id qu'une fois (l'opérateur du téléphone micro garde la main ensuite).
  * Audio (enregistreur -> retour, 1 paquet = 5 ms) :
  *   magic AUDIO | seq i32 | flags u8 | crête f32 (0..1) | durée prise ms i32 | n i16 | n x PCM i16
  */
@@ -21,6 +24,7 @@ object Protocol {
     const val BEACON_MAGIC = 0x52534231 // "RSB1"
     const val HELLO_MAGIC = 0x52534831  // "RSH1"
     const val AUDIO_MAGIC = 0x52534131  // "RSA1"
+    const val COMMAND_MAGIC = 0x52534331 // "RSC1"
     const val AUDIO_HEADER = 19
 
     const val FLAG_RECORDING = 1

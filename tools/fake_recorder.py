@@ -8,6 +8,8 @@ Sert à tester le mode Retour du téléphone sans micro.
     python tools/fake_recorder.py
     python tools/fake_recorder.py --rec     # se déclare "en enregistrement"
     python tools/fake_recorder.py --no-usb  # simule un micro USB débranché
+
+Obéit aux commandes REC/STOP envoyées par le retour.
 """
 import argparse
 import math
@@ -19,6 +21,7 @@ import time
 AUDIO_MAGIC = 0x52534131
 HELLO_MAGIC = 0x52534831
 BEACON_MAGIC = 0x52534231
+COMMAND_MAGIC = 0x52534331
 DISCOVERY_PORT = 47000
 AUDIO_PORT = 47001
 RATE = 48000
@@ -63,6 +66,8 @@ def main():
     beacon = struct.pack(">iBB", BEACON_MAGIC, flags, len(name)) + name
 
     listeners = {}
+    last_cmd = {}
+    rec_start = 0
     seq = 0
     sample = 0
     start = time.perf_counter()
@@ -90,10 +95,19 @@ def main():
                     if addr not in listeners:
                         print(f"retour connecté : {addr}")
                     listeners[addr] = now
+                elif len(data) >= 10 and struct.unpack(">i", data[:4])[0] == COMMAND_MAGIC:
+                    cid, rec, ln = struct.unpack(">iBB", data[4:10])
+                    if last_cmd.get(addr) != cid:
+                        last_cmd[addr] = cid
+                        who = data[10:10 + ln].decode(errors="replace")
+                        print(f"commande {'REC' if rec else 'STOP'} de {who} {addr}")
+                        if rec and not flags & 1:
+                            rec_start = sample
+                        flags = (flags | 1) if rec else (flags & ~1)
             # Envoie tous les paquets dus depuis le début (rattrape les retards du minuteur Windows).
             while sample + N <= (now - start) * RATE:
                 pcm, peak = tone_block(sample)
-                elapsed = int(sample * 1000 / RATE) if args.rec else 0
+                elapsed = int((sample - rec_start) * 1000 / RATE) if flags & 1 else 0
                 pkt = struct.pack(">iiBfih", AUDIO_MAGIC, seq, flags, peak, elapsed, N) + pcm
                 for a in listeners:
                     sock.sendto(pkt, a)

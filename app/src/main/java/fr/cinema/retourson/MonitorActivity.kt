@@ -1,6 +1,7 @@
 package fr.cinema.retourson
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.Context
 import android.graphics.Color
 import android.media.AudioManager
@@ -19,11 +20,13 @@ class MonitorActivity : Activity() {
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var meter: LevelMeterView
     private lateinit var txtStatus: TextView
-    private lateinit var txtRec: TextView
+    private lateinit var btnRec: Button
     private lateinit var txtClip: TextView
     private lateinit var txtJitter: TextView
     private lateinit var txtDelay: TextView
     private lateinit var txtStats: TextView
+
+    private var frame = 0
 
     private val tick = object : Runnable {
         override fun run() {
@@ -38,7 +41,7 @@ class MonitorActivity : Activity() {
         volumeControlStream = AudioManager.STREAM_MUSIC
         meter = findViewById(R.id.meter)
         txtStatus = findViewById(R.id.txtStatus)
-        txtRec = findViewById(R.id.txtRec)
+        btnRec = findViewById(R.id.btnRec)
         txtClip = findViewById(R.id.txtClip)
         txtJitter = findViewById(R.id.txtJitter)
         txtDelay = findViewById(R.id.txtDelay)
@@ -69,6 +72,34 @@ class MonitorActivity : Activity() {
                     prefs.edit().putInt("delay", p * 10).apply()
                 }
             })
+        }
+
+        // Comme sur l'enregistreur : démarrer = immédiat, arrêter = confirmation.
+        btnRec.setOnClickListener {
+            val connected = SystemClock.elapsedRealtime() - MonitorService.lastPacketMs < 1000
+            when {
+                remoteBlocked() -> AlertDialog.Builder(this)
+                    .setTitle("Enregistrement impossible")
+                    .setMessage("Sur le téléphone micro : " + "Une autre application utilise le micro (Rode Central ?). Ferme-la : le micro revient tout seul.")
+                    .setPositiveButton("OK", null)
+                    .show()
+                !connected -> Toast.makeText(this, "Pas connecté à l'enregistreur", Toast.LENGTH_SHORT).show()
+                MonitorService.pendingRec != null -> {}
+                MonitorService.remoteRecording -> AlertDialog.Builder(this)
+                    .setTitle("Arrêter l'enregistrement ?")
+                    .setMessage("La prise en cours sur le téléphone micro sera terminée.")
+                    .setPositiveButton("Arrêter") { _, _ -> MonitorService.requestRec(false) }
+                    .setNegativeButton("Continuer", null)
+                    .show()
+                else -> MonitorService.requestRec(true)
+            }
+        }
+        val advanced = findViewById<View>(R.id.advanced)
+        val btnAdvanced = findViewById<Button>(R.id.btnAdvanced)
+        btnAdvanced.setOnClickListener {
+            val show = advanced.visibility != View.VISIBLE
+            advanced.visibility = if (show) View.VISIBLE else View.GONE
+            btnAdvanced.text = if (show) "Réglages avancés ▴" else "Réglages avancés ▾"
         }
 
         findViewById<Button>(R.id.btnNext).setOnClickListener {
@@ -109,51 +140,75 @@ class MonitorActivity : Activity() {
         val connected = now - MonitorService.lastPacketMs < 1000
         meter.setPeak(if (connected) MonitorService.meterPeak else 0f)
         MonitorService.meterPeak = 0f
+        if (frame++ % 4 != 0) return
 
         val target = MonitorService.target
         val name = target?.let { MonitorService.recorders[it]?.name } ?: ""
-        txtStatus.text = when {
+        txtStatus.setTextIfChanged(when {
             target == null -> "Recherche d'un enregistreur…"
             connected -> "● Connecté à $name ($target)"
+            remoteBlocked() -> "⚠ Micro coupé sur $name ($target)"
             MonitorService.lastPacketMs == 0L -> "Connexion à $name ($target)…"
             else -> "⚠ Signal perdu — $name ($target)"
-        }
+        })
         txtStatus.setTextColor(if (connected) Color.rgb(90, 220, 120) else Color.rgb(255, 170, 0))
 
-        if (connected && MonitorService.remoteRecording) {
-            txtRec.text = "● REC  " + formatDuration(MonitorService.remoteElapsedMs.toLong())
-            txtRec.setTextColor(Color.rgb(255, 60, 60))
-        } else {
-            txtRec.text = if (connected) "Pas d'enregistrement en cours" else "—"
-            txtRec.setTextColor(Color.GRAY)
+        val pending = MonitorService.pendingRec
+        when {
+            !connected -> {
+                btnRec.setTextIfChanged("ENREGISTRER")
+                btnRec.setBgIfChanged(Color.rgb(45, 45, 45))
+                btnRec.setTextColor(Color.GRAY)
+            }
+            pending != null -> {
+                btnRec.setTextIfChanged(if (pending) "Démarrage…" else "Arrêt…")
+                btnRec.setBgIfChanged(Color.rgb(70, 70, 70))
+                btnRec.setTextColor(Color.WHITE)
+            }
+            MonitorService.remoteRecording -> {
+                btnRec.setTextIfChanged("● REC  " + formatDuration(MonitorService.remoteElapsedMs.toLong()))
+                btnRec.setBgIfChanged(Color.rgb(200, 30, 30))
+                btnRec.setTextColor(Color.WHITE)
+            }
+            else -> {
+                btnRec.setTextIfChanged("ENREGISTRER")
+                btnRec.setBgIfChanged(Color.rgb(70, 70, 70))
+                btnRec.setTextColor(Color.WHITE)
+            }
+        }
+        if (MonitorService.commandFailed) {
+            MonitorService.commandFailed = false
+            Toast.makeText(this, "L'enregistreur n'a pas répondu — réessaie, ou vérifie qu'il est à jour", Toast.LENGTH_LONG).show()
         }
         when {
-            connected && MonitorService.remoteMicBlocked -> {
-                txtClip.text = "⚠ MICRO COUPÉ SUR L'ENREGISTREUR (autre appli)"
-                txtClip.setBackgroundColor(Color.rgb(198, 40, 40))
+            remoteBlocked() -> {
+                txtClip.setTextIfChanged("⚠ MICRO COUPÉ SUR L'ENREGISTREUR (autre appli)")
+                txtClip.setBgIfChanged(Color.rgb(198, 40, 40))
                 txtClip.visibility = View.VISIBLE
             }
             connected && MonitorService.remoteNotUsbMic -> {
-                txtClip.text = "⚠ MICRO USB NON BRANCHÉ SUR L'ENREGISTREUR"
-                txtClip.setBackgroundColor(Color.rgb(230, 120, 0))
+                txtClip.setTextIfChanged("⚠ MICRO USB NON BRANCHÉ SUR L'ENREGISTREUR")
+                txtClip.setBgIfChanged(Color.rgb(230, 120, 0))
                 txtClip.visibility = View.VISIBLE
             }
             now < MonitorService.clipUntil -> {
-                txtClip.text = "SATURATION"
-                txtClip.setBackgroundColor(Color.rgb(198, 40, 40))
+                txtClip.setTextIfChanged("SATURATION")
+                txtClip.setBgIfChanged(Color.rgb(198, 40, 40))
                 txtClip.visibility = View.VISIBLE
             }
             else -> txtClip.visibility = View.INVISIBLE
         }
 
-        txtJitter.text = "Tampon anti-coupures : ${MonitorService.jitterMs} ms"
-        txtDelay.text = "Retard ajouté (calage sur l'image) : ${MonitorService.delayMs} ms"
+        txtJitter.setTextIfChanged("Tampon anti-coupures : ${MonitorService.jitterMs} ms")
+        txtDelay.setTextIfChanged("Retard ajouté (calage sur l'image) : ${MonitorService.delayMs} ms")
         val net = MonitorService.bufferMs
         val outMs = MonitorService.outputLatencyMs
-        txtStats.text = "Latence ≈ ${net + outMs + CAPTURE_AND_NETWORK_MS} ms (réseau $net + sortie $outMs + capture ~$CAPTURE_AND_NETWORK_MS)" +
+        txtStats.setTextIfChanged("Latence ≈ ${net + outMs + CAPTURE_AND_NETWORK_MS} ms (réseau $net + sortie $outMs + capture ~$CAPTURE_AND_NETWORK_MS)" +
             "\npaquets perdus ${MonitorService.lost} · coupures ${MonitorService.underruns}" +
-            (MonitorService.error?.let { "\n$it" } ?: "")
+            (MonitorService.error?.let { "\n$it" } ?: ""))
     }
+
+    private fun remoteBlocked() = MonitorService.remoteBlocked()
 
     companion object {
         /** Estimation : tampon de capture Android (~20 ms) + paquet de 5 ms + transit Wi-Fi. */

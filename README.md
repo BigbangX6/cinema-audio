@@ -9,12 +9,20 @@ et l'envoie **en direct** sur le Wi-Fi local (sans internet) à un ou plusieurs 
   L'en-tête est mis à jour chaque seconde : en cas de plantage, la prise reste lisible.
   Le réseau passe par une file non bloquante : il ne peut jamais perturber l'enregistrement.
   Le micro reste ouvert hors prise, pour que le retour entende aussi les répétitions.
-  Démarrer = appui simple, arrêter = appui long.
+  Démarrer = appui simple, arrêter = confirmation.
+  Si une autre appli (Rode Central) prend le micro : alerte sur l'enregistreur et les retours,
+  REC refusé, et le micro revient tout seul quand elle le rend (chien de garde : micro rouvert s'il se bloque).
 - **Retour** : trouve l'enregistreur tout seul sur le réseau, joue le son avec
   - un **tampon anti-coupures** réglable (10–200 ms),
   - un **retard ajouté** (0–1000 ms) pour caler le son sur le retour vidéo (ou compenser le Bluetooth),
   - indicateur de niveau, alerte de saturation, état REC et durée de la prise.
 - Aucun envoi audio quand personne n'écoute (économie de batterie).
+- **REC / STOP à distance** depuis un retour (micro sur pied, équipe réduite) : commande répétée
+  jusqu'à confirmation par l'enregistreur, arrêt avec confirmation.
+- **Prises** : groupées par jour (« Sélectionner le jour »), appui = écouter, appui long = sélection ;
+  partage Android de plusieurs fichiers (Drive, Quick Share...), renommage (ex. `S12_P3_T2`), suppression.
+
+Interface : le vumètre est rafraîchi à 20 images/s, le reste 5 fois/s et seulement s'il change.
 
 ## Réseau
 

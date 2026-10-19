@@ -29,6 +29,7 @@ class MonitorService : Service() {
 
     class Recorder(val ip: String, val name: String) {
         @Volatile var lastSeen = 0L
+        @Volatile var flags = 0
     }
 
     companion object {
@@ -58,6 +59,38 @@ class MonitorService : Service() {
                 field = v
                 if (v != null) Log.e(Protocol.TAG, v)
             }
+
+        /** Commande REC/STOP en attente de confirmation par l'enregistreur (null = aucune). */
+        @Volatile var pendingRec: Boolean? = null; private set
+        @Volatile private var pendingUntil = 0L
+        @Volatile private var pendingId = 0
+        /** La dernière commande n'a pas été confirmée à temps. */
+        @Volatile var commandFailed = false
+
+        /** Demande à l'enregistreur écouté de démarrer (true) ou d'arrêter (false) la prise. */
+        fun requestRec(rec: Boolean) {
+            commandFailed = false
+            pendingId = (SystemClock.elapsedRealtime() and 0x7fffffff).toInt()
+            pendingUntil = SystemClock.elapsedRealtime() + COMMAND_TIMEOUT_MS
+            pendingRec = rec
+            wake.offer(Unit)
+        }
+
+        /** Réveille la boucle d'envoi dès qu'une commande est demandée. */
+        private val wake = java.util.concurrent.LinkedBlockingQueue<Unit>(1)
+
+        private const val COMMAND_TIMEOUT_MS = 3000L
+
+        /**
+         * Micro de l'enregistreur pris par une autre appli : d'après l'audio s'il arrive, sinon d'après
+         * la balise (l'enregistreur n'envoie plus de son quand son micro est bloqué).
+         */
+        fun remoteBlocked(): Boolean {
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastPacketMs < 1000) return remoteMicBlocked
+            val r = target?.let { recorders[it] } ?: return false
+            return now - r.lastSeen < 3000 && r.flags and Protocol.FLAG_MIC_BLOCKED != 0
+        }
 
         fun start(ctx: Context) {
             ctx.startForegroundService(Intent(ctx, MonitorService::class.java))
@@ -89,6 +122,7 @@ class MonitorService : Service() {
 
     override fun onDestroy() {
         running = false
+        Notifications.cancelAlert(this)
         audioSocket?.close()
         discoverySocket?.close()
         threads.forEach { it.join(1500) }
@@ -147,29 +181,71 @@ class MonitorService : Service() {
             if (p.length < 6) continue
             val b = ByteBuffer.wrap(buf, 0, p.length)
             if (b.int != Protocol.BEACON_MAGIC) continue
-            b.get() // drapeaux
+            val flags = b.get().toInt()
             val len = b.get().toInt() and 0xff
             if (b.remaining() < len) continue
             val name = String(buf, b.position(), len, Charsets.UTF_8)
             val ip = p.address.hostAddress ?: continue
-            recorders.getOrPut(ip) { Recorder(ip, name) }.lastSeen = SystemClock.elapsedRealtime()
+            recorders.getOrPut(ip) { Recorder(ip, name) }.also {
+                it.lastSeen = SystemClock.elapsedRealtime()
+                it.flags = flags
+            }
             if (target == null) target = ip
         }
     }
 
     private fun helloLoop(sock: DatagramSocket) {
         val hello = ByteBuffer.allocate(4).putInt(Protocol.HELLO_MAGIC).array()
+        val myName = android.os.Build.MODEL.toByteArray(Charsets.UTF_8).take(200).toByteArray()
+        var nextHello = 0L
+        var alerted = false
+        fun send(data: ByteArray, ip: String) {
+            try {
+                sock.send(DatagramPacket(data, data.size, InetAddress.getByName(ip), Protocol.AUDIO_PORT))
+            } catch (_: Exception) {
+            }
+        }
         while (running) {
-            target?.let { ip ->
-                try {
-                    sock.send(DatagramPacket(hello, hello.size, InetAddress.getByName(ip), Protocol.AUDIO_PORT))
-                } catch (_: Exception) {
+            val now = SystemClock.elapsedRealtime()
+            val ip = target
+            if (ip != null && now >= nextHello) {
+                send(hello, ip)
+                recorders.entries.removeIf { it.key != target && now - it.value.lastSeen > 5000 }
+                nextHello = now + 500
+            }
+            // Le réalisateur a souvent le téléphone en poche : alerte qui vibre, même écran éteint.
+            val blocked = remoteBlocked()
+            if (blocked != alerted) {
+                alerted = blocked
+                if (blocked) {
+                    Notifications.alert(
+                        this, "⚠ Micro coupé sur l'enregistreur",
+                        "Une autre appli (Rode Central ?) a pris le micro du téléphone enregistreur : rien n'est enregistré.",
+                        MonitorActivity::class.java,
+                    )
+                } else {
+                    Notifications.cancelAlert(this)
                 }
             }
-            val now = SystemClock.elapsedRealtime()
-            recorders.entries.removeIf { it.key != target && now - it.value.lastSeen > 5000 }
+            // Commande REC/STOP : répétée toutes les 100 ms jusqu'à ce que l'état REC reçu corresponde.
+            pendingRec?.let { want ->
+                when {
+                    now - lastPacketMs < 1000 && remoteRecording == want -> pendingRec = null
+                    now > pendingUntil -> {
+                        pendingRec = null
+                        commandFailed = true
+                        Log.w(Protocol.TAG, "Commande ${if (want) "REC" else "STOP"} non confirmée par l'enregistreur")
+                    }
+                    ip != null -> send(
+                        ByteBuffer.allocate(10 + myName.size).putInt(Protocol.COMMAND_MAGIC).putInt(pendingId)
+                            .put((if (want) 1 else 0).toByte()).put(myName.size.toByte()).put(myName).array(),
+                        ip,
+                    )
+                }
+            }
             try {
-                Thread.sleep(500)
+                // Réveil toutes les 100 ms seulement pendant une commande, sinon toutes les 500 ms.
+                wake.poll(if (pendingRec != null) 100L else maxOf(10L, nextHello - SystemClock.elapsedRealtime()), java.util.concurrent.TimeUnit.MILLISECONDS)
             } catch (_: InterruptedException) {
                 break
             }

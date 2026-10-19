@@ -35,13 +35,16 @@ class LevelMeterView(context: Context, attrs: AttributeSet?) : View(context, att
     /** [peak] : crête linéaire 0..1 depuis la dernière mise à jour (toutes les ~50 ms). */
     fun setPeak(peak: Float) {
         val newDb = if (peak <= 0f) MIN_DB else (20f * log10(peak)).coerceIn(MIN_DB, 0f)
+        val oldDb = db
+        val oldHold = holdDb
         db = if (newDb > db) newDb else maxOf(newDb, db - 1.5f)
         val now = SystemClock.uptimeMillis()
         if (newDb >= holdDb || now - holdTime > 1500) {
             holdDb = newDb
             holdTime = now
         }
-        invalidate()
+        // Rien ne bouge (silence, micro coupé) : pas de redessin.
+        if (db != oldDb || holdDb != oldHold) invalidate()
     }
 
     override fun onDraw(canvas: Canvas) {

@@ -31,6 +31,8 @@ import kotlin.math.abs
 class CaptureService : Service() {
 
     companion object {
+        /** Sans nouvelles du micro pendant ce temps, on le considère bloqué et on le rouvre. */
+        private const val STALL_MS = 1000L
         const val ACTION_START = "start"
         const val ACTION_REC = "rec"
         const val ACTION_STOP_REC = "stop_rec"
@@ -51,6 +53,8 @@ class CaptureService : Service() {
                 if (v != null) Log.e(Protocol.TAG, v)
             }
         @Volatile var clipUntil = 0L; private set
+        /** Dernière commande reçue d'un retour, pour l'afficher sur l'enregistreur. */
+        @Volatile var remoteInfo: String? = null; private set
         /** Crête depuis la dernière lecture par l'interface (remise à 0 par l'interface). */
         @Volatile var meterPeak = 0f
 
@@ -85,7 +89,7 @@ class CaptureService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> if (!running) begin()
-            ACTION_REC -> wantRecording = true
+            ACTION_REC -> if (!micBlocked) wantRecording = true
             ACTION_STOP_REC -> wantRecording = false
         }
         return START_NOT_STICKY
@@ -107,6 +111,7 @@ class CaptureService : Service() {
         )
         locks.acquire()
         error = null
+        remoteInfo = null
         running = true
         thread = Thread({ captureLoop() }, "capture").also { it.start() }
     }
@@ -118,18 +123,25 @@ class CaptureService : Service() {
         )
     }
 
+    /** Micro ouvert en ce moment (remplacé quand on le rouvre). */
+    @Volatile private var rec: AudioRecord? = null
+    /** Heure de la dernière lecture réussie du micro, surveillée par le chien de garde. */
+    @Volatile private var lastDataMs = 0L
+    /** Le micro ne livre plus rien (bloqué ou pris par une autre appli) : il faut le rouvrir. */
+    @Volatile private var stalled = false
+
     private fun captureLoop() {
         Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
-        val opened = openRecord()
-        if (opened == null) {
-            error = "Impossible d'ouvrir le micro"
-            running = false
-            stopSelf()
-            return
-        }
-        val (rec, isFloat) = opened
         val net = try {
-            AudioStreamer(Build.MODEL).also { it.start() }
+            AudioStreamer(Build.MODEL) { rec, from ->
+                val time = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.FRANCE).format(java.util.Date())
+                if (rec && micBlocked) {
+                    remoteInfo = "REC refusé (micro pris par une autre appli), demandé par $from à $time"
+                } else {
+                    remoteInfo = "${if (rec) "Démarré" else "Arrêté"} à distance par $from à $time"
+                    wantRecording = rec
+                }
+            }.also { it.start() }
         } catch (e: Exception) {
             error = "Réseau indisponible : ${e.message}"
             null
@@ -147,53 +159,105 @@ class CaptureService : Service() {
             }
         }.also { it.start() }
 
+        // Si le câble du micro se débranche, Android bascule en silence sur le micro du téléphone :
+        // on le signale, et on revient sur le micro USB dès qu'il est rebranché.
+        deviceCallback = object : AudioDeviceCallback() {
+            override fun onAudioDevicesAdded(added: Array<out AudioDeviceInfo>) {
+                val r = rec ?: return
+                // Appelé aussi à l'inscription avec les appareils déjà présents : ne pas re-router
+                // un micro qui est déjà sur l'USB (sur certains Samsung, ça casse le flux).
+                if (r.routedDevice?.let { isUsb(it) } == true) return
+                added.firstOrNull { it.isSource && isUsb(it) }?.let {
+                    Log.i(Protocol.TAG, "Micro USB rebranché : ${it.productName}")
+                    r.preferredDevice = it
+                }
+            }
+
+            override fun onAudioDevicesRemoved(removed: Array<out AudioDeviceInfo>) {
+                if (removed.any { it.isSource && isUsb(it) }) Log.w(Protocol.TAG, "Micro USB débranché !")
+                updateInput(rec?.routedDevice)
+            }
+        }.also { audioManager.registerAudioDeviceCallback(it, mainHandler) }
+        // Android ne laisse qu'une appli entendre le micro : si une autre l'ouvre, on reçoit du silence.
+        audioManager.registerAudioRecordingCallback(recordingCallback, mainHandler)
+
+        // Chien de garde : Rode Central prend le micro au niveau USB, sans prévenir Android ;
+        // la lecture se bloque alors indéfiniment. On le détecte et on débloque la lecture.
+        val watchdog = Thread({
+            while (running) {
+                try {
+                    Thread.sleep(250)
+                } catch (_: InterruptedException) {
+                    break
+                }
+                if (!stalled && SystemClock.elapsedRealtime() - lastDataMs > STALL_MS) {
+                    Log.e(Protocol.TAG, "Micro bloqué : plus rien depuis $STALL_MS ms")
+                    stalled = true
+                    setMicBlocked(true)
+                    try {
+                        rec?.stop() // débloque read()
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+        }, "capture-watchdog")
+
         val n = Protocol.FRAMES_PER_PACKET
         val f = FloatArray(n)
         val s = ShortArray(n)
         var inTake = false
         try {
-            rec.startRecording()
-            updateInput(rec.routedDevice)
-            // Si le câble du micro se débranche, Android bascule en silence sur le micro du téléphone :
-            // on le signale, et on revient sur le micro USB dès qu'il est rebranché.
-            rec.addOnRoutingChangedListener(routingListener, mainHandler)
-            deviceCallback = object : AudioDeviceCallback() {
-                override fun onAudioDevicesAdded(added: Array<out AudioDeviceInfo>) {
-                    added.firstOrNull { it.isSource && isUsb(it) }?.let {
-                        Log.i(Protocol.TAG, "Micro USB rebranché : ${it.productName}")
-                        rec.preferredDevice = it
-                    }
-                }
-
-                override fun onAudioDevicesRemoved(removed: Array<out AudioDeviceInfo>) {
-                    if (removed.any { it.isSource && isUsb(it) }) Log.w(Protocol.TAG, "Micro USB débranché !")
-                    updateInput(rec.routedDevice)
-                }
-            }.also { audioManager.registerAudioDeviceCallback(it, mainHandler) }
-            // Android ne laisse qu'une appli entendre le micro : si une autre (ex. Rode Central)
-            // l'ouvre, on reçoit du silence. On le détecte pour alerter tout le monde.
-            sessionId = rec.audioSessionId
-            audioManager.registerAudioRecordingCallback(recordingCallback, mainHandler)
+            lastDataMs = SystemClock.elapsedRealtime()
+            watchdog.start()
             var zeroChunks = 0
-            Log.i(Protocol.TAG, "Capture démarrée : entrée=$inputName usb=$inputIsUsb · $formatName")
             var nextStats = SystemClock.elapsedRealtime() + 5000
             var maxPeak = 0f
             var lastRead = SystemClock.elapsedRealtime()
             var maxReadGap = 0L
             var framesRead = 0L
+            var isFloat = false
             val ts = AudioTimestamp()
 
             while (running) {
+                val r = rec
+                if (r == null || stalled) {
+                    // (Ré)ouverture du micro, toutes les secondes tant qu'il reste indisponible.
+                    if (r != null) closeRecord(r)
+                    if (r != null || framesRead > 0) {
+                        try {
+                            Thread.sleep(1000)
+                        } catch (_: InterruptedException) {
+                        }
+                        if (!running) break
+                    }
+                    val opened = openRecord()
+                    if (opened == null) {
+                        setMicBlocked(true)
+                        lastDataMs = SystemClock.elapsedRealtime()
+                        framesRead = 1 // pour attendre avant le prochain essai
+                        continue
+                    }
+                    isFloat = opened.second
+                    startRecord(opened.first)
+                    framesRead = 0
+                    zeroChunks = 0
+                    lastDataMs = SystemClock.elapsedRealtime()
+                    stalled = false
+                    continue
+                }
                 val got = if (isFloat) {
-                    rec.read(f, 0, n, AudioRecord.READ_BLOCKING)
+                    r.read(f, 0, n, AudioRecord.READ_BLOCKING)
                 } else {
-                    rec.read(s, 0, n).also { g -> for (i in 0 until g) f[i] = s[i] / 32768f }
+                    r.read(s, 0, n).also { g -> for (i in 0 until g) f[i] = s[i] / 32768f }
                 }
                 if (got < 0) {
-                    error = "Erreur micro ($got)"
-                    break
+                    Log.e(Protocol.TAG, "Erreur micro ($got) : réouverture")
+                    stalled = true
+                    setMicBlocked(true)
+                    continue
                 }
                 if (got == 0) continue
+                lastDataMs = SystemClock.elapsedRealtime()
                 framesRead += got
                 SystemClock.elapsedRealtime().let { t ->
                     if (t - lastRead > maxReadGap) maxReadGap = t - lastRead
@@ -212,28 +276,12 @@ class CaptureService : Service() {
                 if (peak > meterPeak) meterPeak = peak
                 // Filet de sécurité : un vrai micro n'est jamais à zéro absolu pendant 1 s.
                 zeroChunks = if (peak == 0f) zeroChunks + 1 else 0
-                val blocked = systemSilenced || zeroChunks > 200
-                if (blocked != micBlocked) {
-                    micBlocked = blocked
-                    if (blocked) Log.e(Protocol.TAG, "MICRO COUPÉ : silence reçu (autre appli sur le micro ?)")
-                    else Log.i(Protocol.TAG, "Micro rétabli")
-                    mainHandler.post {
-                        if (blocked) {
-                            Notifications.alert(
-                                this, "⚠ Micro coupé — la prise est muette",
-                                "Une autre appli (Rode Central ?) a pris le micro. Touche ici pour le récupérer.",
-                                RecorderActivity::class.java,
-                            )
-                        } else {
-                            Notifications.cancelAlert(this)
-                        }
-                    }
-                }
+                setMicBlocked(systemSilenced || zeroChunks > 200)
                 if (peak > maxPeak) maxPeak = peak
                 val tNow = SystemClock.elapsedRealtime()
                 if (tNow >= nextStats) {
                     // Latence de capture : âge de la dernière trame lue, d'après l'horloge du convertisseur.
-                    if (rec.getTimestamp(ts, AudioTimestamp.TIMEBASE_MONOTONIC) == AudioRecord.SUCCESS) {
+                    if (r.getTimestamp(ts, AudioTimestamp.TIMEBASE_MONOTONIC) == AudioRecord.SUCCESS) {
                         val capturedAtNs = ts.nanoTime + (framesRead - ts.framePosition) * 1_000_000_000L / Protocol.SAMPLE_RATE
                         captureLatencyMs = ((System.nanoTime() - capturedAtNs) / 1_000_000).toInt()
                     }
@@ -266,25 +314,60 @@ class CaptureService : Service() {
                 net?.push(f, got, peak, recFlags, elapsed)
             }
         } finally {
+            running = false
+            watchdog.interrupt()
             if (inTake) writer.end()
             writer.close()
             recording = false
             wantRecording = false
-            rec.removeOnRoutingChangedListener(routingListener)
             audioManager.unregisterAudioRecordingCallback(recordingCallback)
-            micBlocked = false
+            setMicBlocked(false)
             systemSilenced = false
             deviceCallback?.let { audioManager.unregisterAudioDeviceCallback(it) }
             deviceCallback = null
-            try {
-                rec.stop()
-            } catch (_: Exception) {
-            }
-            rec.release()
+            rec?.let { closeRecord(it) }
             streamer = null
             net?.close()
-            running = false
             if (error != null) stopSelf()
+        }
+    }
+
+    private fun startRecord(r: AudioRecord) {
+        r.startRecording()
+        rec = r
+        sessionId = r.audioSessionId
+        updateInput(r.routedDevice)
+        r.addOnRoutingChangedListener(routingListener, mainHandler)
+        Log.i(Protocol.TAG, "Capture démarrée : entrée=$inputName usb=$inputIsUsb · $formatName")
+    }
+
+    private fun closeRecord(r: AudioRecord) {
+        if (rec === r) rec = null
+        r.removeOnRoutingChangedListener(routingListener)
+        try {
+            r.stop()
+        } catch (_: Exception) {
+        }
+        r.release()
+    }
+
+    /** Alerte « micro coupé » sur l'enregistreur, dans la notification et sur les retours. */
+    private fun setMicBlocked(blocked: Boolean) {
+        if (blocked == micBlocked) return
+        micBlocked = blocked
+        streamer?.micBlocked = blocked
+        if (blocked) Log.e(Protocol.TAG, "MICRO COUPÉ (autre appli sur le micro ?)")
+        else Log.i(Protocol.TAG, "Micro rétabli")
+        mainHandler.post {
+            if (blocked) {
+                Notifications.alert(
+                    this, "⚠ Micro coupé — la prise est muette",
+                    "Une autre appli (Rode Central ?) a pris le micro. Ferme-la : le micro revient tout seul.",
+                    RecorderActivity::class.java,
+                )
+            } else {
+                Notifications.cancelAlert(this)
+            }
         }
     }
 
